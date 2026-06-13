@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    name: Release
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          ASSET="pinentry-dispatch-${VERSION}-aarch64-apple-darwin.tar.gz"
+          tar czf "$ASSET" -C target/release pinentry-dispatch
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.ASSET }}
+
+      - name: Update Homebrew Formula
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          SHA=$(shasum -a 256 "$ASSET" | awk '{print $1}')
+
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/giggs-lynx/homebrew-tap.git
+          cd homebrew-tap
+
+          sed -i '' -E "s|/download/v[^/]*/pinentry-dispatch-[^-]*-aarch64|/download/v${VERSION}/pinentry-dispatch-${VERSION}-aarch64|" Formula/pinentry-dispatch.rb
+          sed -i '' "s/sha256 \".*\"/sha256 \"${SHA}\"/" Formula/pinentry-dispatch.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pinentry-dispatch.rb
+          git commit -m "chore: bump pinentry-dispatch to ${VERSION}"
+          git push
