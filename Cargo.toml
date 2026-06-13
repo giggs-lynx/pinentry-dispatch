@@ -1,0 +1,16 @@
+[package]
+name = "pinentry-dispatch"
+version = "0.1.0"
+edition = "2021"
+description = "Route GnuPG pinentry to Touch ID locally and curses over SSH"
+license = "MIT"
+
+[[bin]]
+name = "pinentry-dispatch"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
