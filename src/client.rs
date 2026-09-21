@@ -47,19 +47,23 @@ impl Client {
         !(self.env.contains_key("SSH_CONNECTION") || self.env.contains_key("SSH_TTY"))
     }
 
-    /// `ttyname` is whatever the client's GPG_TTY said, which survives in a pane's
-    /// environment long after that terminal belonged to someone else. Drawing on it
-    /// would put a dialog on an unrelated pane — under tmux control mode that tears
-    /// the pane apart — so it counts only when the client really is sitting on it.
-    pub fn owns_tty(&self, ttyname: Option<&str>) -> bool {
-        let Some(ttyname) = ttyname.filter(|name| !name.is_empty()) else {
-            return false;
-        };
-        let Some(actual) = self.controlling_tty.as_deref() else {
-            return false;
-        };
-        let claimed = Path::new(ttyname).file_name().and_then(|n| n.to_str());
-        claimed == Some(actual) && Path::new(ttyname).exists()
+    /// The terminal to draw on, which is the one the caller is actually attached to.
+    ///
+    /// `ttyname` is only a report of the client's `GPG_TTY`, and that variable is not
+    /// dependable: it survives in a pane's environment long after that terminal
+    /// belonged to someone else, and plenty of shells never set it at all. The
+    /// controlling terminal is the fact, so the report is accepted only when it
+    /// agrees and is otherwise ignored rather than trusted or refused.
+    pub fn usable_tty(&self, reported: Option<&str>) -> Option<String> {
+        let actual = self.controlling_tty.as_deref()?;
+        if let Some(reported) = reported.filter(|name| !name.is_empty()) {
+            let same = Path::new(reported).file_name().and_then(|n| n.to_str()) == Some(actual);
+            if same && Path::new(reported).exists() {
+                return Some(reported.to_string());
+            }
+        }
+        let path = format!("/dev/{actual}");
+        Path::new(&path).exists().then_some(path)
     }
 
     pub fn describe(&self) -> String {

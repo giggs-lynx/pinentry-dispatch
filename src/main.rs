@@ -64,13 +64,14 @@ impl Conversation {
     /// when the caller really is sitting on the terminal it reported, never on a tty
     /// some stale environment variable happens to name.
     fn tell_caller(&self, message: &str) {
-        let Some(ttyname) = self.ttyname.as_deref() else {
+        let Some(path) = self
+            .owner_pid
+            .map(Client::inspect)
+            .and_then(|c| c.usable_tty(self.ttyname.as_deref()))
+        else {
             return;
         };
-        if !self.owner_pid.map(Client::inspect).is_some_and(|c| c.owns_tty(Some(ttyname))) {
-            return;
-        }
-        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open(ttyname) {
+        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open(path) {
             let _ = writeln!(tty, "\r\n{message}");
         }
     }
@@ -94,17 +95,19 @@ impl Conversation {
         let Some(keygrip) = &self.keygrip else {
             return Some("no keygrip (not SETKEYINFO n/...)");
         };
-        let Some(store) = store else {
-            return Some("no keychain");
-        };
-        if !(store.has(keygrip) || store.has_legacy(keygrip)) {
-            return Some("nothing stored for this key");
-        }
+        // Locality first: it is the reason that matters when it fails, and asking the
+        // keychain from a session that cannot open it is wasted work anyway.
         if !self.owner_pid.map(Client::inspect).is_some_and(|c| c.is_local()) {
             return Some("caller is not local");
         }
         if !touchid::available() {
             return Some("biometrics unavailable in this process");
+        }
+        let Some(store) = store else {
+            return Some("no keychain");
+        };
+        if !(store.has(keygrip) || store.has_legacy(keygrip)) {
+            return Some("nothing stored for this key");
         }
         None
     }
@@ -243,7 +246,7 @@ fn doctor(args: Vec<String>) {
     println!();
 
     let local = client.is_local();
-    let owns = client.owns_tty(ttyname.as_deref());
+    let owns = client.usable_tty(ttyname.as_deref()).is_some();
     let biometrics = touchid::available();
     let stored = keygrip.as_ref().zip(store.as_ref()).map(|(grip, store)| {
         (store.has(grip), store.has_legacy(grip))
@@ -251,7 +254,7 @@ fn doctor(args: Vec<String>) {
 
     println!("local           {local}");
     println!("biometrics      {biometrics}");
-    println!("owns terminal   {owns}");
+    println!("has terminal    {owns}");
     match (&keygrip, stored) {
         (Some(grip), Some((ours, legacy))) => {
             println!("keygrip         {grip}");
@@ -281,7 +284,7 @@ fn doctor(args: Vec<String>) {
         println!("  note: nothing stored yet — the first signing goes to the terminal and stores its answer");
     }
     if !owns && !(local && biometrics && has_item) {
-        println!("  note: GPG_TTY does not name this process's controlling terminal");
+        println!("  note: this process has no controlling terminal");
     }
 }
 
@@ -430,13 +433,16 @@ fn delegate(
         Some(c) => note(&format!("client {}", c.describe())),
         None => note("no owner reported"),
     }
-    if !client.as_ref().is_some_and(|c| c.owns_tty(talk.ttyname.as_deref())) {
+    let Some(tty) = client.as_ref().and_then(|c| c.usable_tty(talk.ttyname.as_deref())) else {
         respond(
             &mut out,
-            &format!("ERR {ERR_NO_PIN_ENTRY} no terminal the caller is sitting on"),
+            &format!("ERR {ERR_NO_PIN_ENTRY} the caller has no terminal to ask in"),
         );
-        note("route none (caller does not own the reported terminal)");
+        note("route none (caller has no controlling terminal)");
         return;
+    };
+    if talk.ttyname.as_deref() != Some(tty.as_str()) {
+        note(&format!("using the caller's own terminal {tty} (reported {:?})", talk.ttyname));
     }
 
     let Some(binary) = pick_terminal_rung(talk.ttytype.as_deref()) else {
@@ -464,7 +470,15 @@ fn delegate(
     // The agent already has our OK for every one of these, so the replies are ours.
     let mut swallow = String::new();
     let _ = from_child.read_line(&mut swallow);
-    for line in &talk.pending {
+    // The terminal we settled on wins over whatever the client reported, so its option
+    // goes first and any stale one is dropped.
+    let replay = std::iter::once(format!("OPTION ttyname={tty}")).chain(
+        talk.pending
+            .iter()
+            .filter(|line| !line.starts_with("OPTION ttyname="))
+            .cloned(),
+    );
+    for line in replay {
         if writeln!(to_child, "{line}").is_err() {
             break;
         }
@@ -487,6 +501,9 @@ fn delegate(
         if !seen.rejected && talk.external_cache_allowed && !talk.asking_for_a_new_passphrase {
             if store.put(keygrip, secret) {
                 note(&format!("stored passphrase for {keygrip}"));
+            } else {
+                // Expected over SSH: that session has its own locked login keychain.
+                note(&format!("could not store passphrase for {keygrip} (keychain unavailable)"));
             }
         }
     }
@@ -606,7 +623,7 @@ mod tests {
             keygrip: Some("ABC".into()),
             ..Default::default()
         };
-        assert_eq!(talk.touch_id_blocker(&None), Some("no keychain"));
+        assert_eq!(talk.touch_id_blocker(&None), Some("caller is not local"));
         talk.external_cache_allowed = false;
         assert_eq!(talk.touch_id_blocker(&None), Some("agent did not allow an external cache"));
         talk.external_cache_allowed = true;
