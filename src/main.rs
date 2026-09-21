@@ -86,10 +86,8 @@ impl Conversation {
 
 fn main() {
     let mut args = env::args().skip(1);
-    match args.next().as_deref() {
-        Some("--keychain") => return report_store(&args.next().unwrap_or_default()),
-        Some("--explain") => return report_client(args.next().and_then(|a| a.parse().ok())),
-        _ => {}
+    if args.next().as_deref() == Some("doctor") {
+        return doctor(args.collect());
     }
 
     let stdin = io::stdin();
@@ -187,26 +185,87 @@ fn try_touch_id(talk: &Conversation, store: &Option<Store>) -> Option<Answer> {
     }
 }
 
-fn report_store(keygrip: &str) {
-    match Store::open() {
-        Some(store) => {
-            println!("ours   = {}", store.has(keygrip));
-            println!("legacy = {} (service GnuPG, written by pinentry-mac)", store.has_legacy(keygrip));
+/// Says which rung this situation would reach and what each condition contributed.
+/// Run it from the terminal you are asking about: without `--client` it inspects
+/// itself, which stands in for the gpg that would be asking from the same place.
+fn doctor(args: Vec<String>) {
+    let pid = flag(&args, "--client")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(std::process::id);
+    let keygrip = flag(&args, "--keygrip").or_else(default_signing_keygrip);
+    let ttyname = env::var("GPG_TTY").ok();
+
+    let client = Client::inspect(pid);
+    let store = Store::open();
+
+    println!("client    {}", client.describe());
+    println!("GPG_TTY   {}", ttyname.as_deref().unwrap_or("(unset)"));
+    println!();
+
+    let local = client.is_local();
+    let owns = client.owns_tty(ttyname.as_deref());
+    let biometrics = touchid::available();
+    let stored = keygrip.as_ref().zip(store.as_ref()).map(|(grip, store)| {
+        (store.has(grip), store.has_legacy(grip))
+    });
+
+    println!("local           {local}");
+    println!("biometrics      {biometrics}");
+    println!("owns terminal   {owns}");
+    match (&keygrip, stored) {
+        (Some(grip), Some((ours, legacy))) => {
+            println!("keygrip         {grip}");
+            println!("stored          ours={ours} legacy={legacy}");
         }
-        None => println!("no default keychain"),
+        (Some(grip), None) => println!("keygrip         {grip} (no keychain)"),
+        (None, _) => println!("keygrip         unknown — pass --keygrip to check storage"),
+    }
+    println!();
+
+    let has_item = stored.is_some_and(|(ours, legacy)| ours || legacy);
+    let route = if local && biometrics && has_item {
+        "Touch ID".to_string()
+    } else if owns {
+        match pick_terminal_rung(env::var("TERM").ok().as_deref()) {
+            Some(path) => path.display().to_string(),
+            None => "nothing — no terminal pinentry installed".to_string(),
+        }
+    } else {
+        "nothing — would refuse with No pinentry".to_string()
+    };
+    println!("route           {route}");
+    if !local {
+        println!("  note: not local, so Touch ID is out even if biometrics work here");
+    }
+    if local && biometrics && !has_item && owns {
+        println!("  note: nothing stored yet — the first signing goes to the terminal and stores its answer");
+    }
+    if !owns && !(local && biometrics && has_item) {
+        println!("  note: GPG_TTY does not name this process's controlling terminal");
     }
 }
 
-fn report_client(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        eprintln!("usage: pinentry-dispatch --explain <client-pid>");
-        std::process::exit(2);
-    };
-    let client = Client::inspect(pid);
-    println!("{}", client.describe());
-    println!("local     = {}", client.is_local());
-    println!("owns tty  = {}", client.owns_tty(env::var("GPG_TTY").ok().as_deref()));
-    println!("touch id  = {} (biometrics usable here)", touchid::available());
+fn flag(args: &[String], name: &str) -> Option<String> {
+    let at = args.iter().position(|a| a == name)?;
+    args.get(at + 1).cloned()
+}
+
+fn default_signing_keygrip() -> Option<String> {
+    let key = Command::new("git")
+        .args(["config", "--get", "user.signingkey"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let key = String::from_utf8_lossy(&key.stdout).trim().to_string();
+    let listing = Command::new("gpg")
+        .args(["--list-secret-keys", "--with-keygrip", "--keyid-format", "LONG", &key])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Keygrip = "))
+        .map(str::to_string)
 }
 
 /// `SETKEYINFO n/<keygrip>` is an ordinary key. `u/` carries a cache id the calling

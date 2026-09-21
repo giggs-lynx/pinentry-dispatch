@@ -5,6 +5,7 @@
 //! description, so an item whose service and account are both right is still invisible
 //! if the label differs. Keying on the account alone removes that whole class of bug.
 
+use security_framework::item::{ItemClass, ItemSearchOptions};
 use security_framework::os::macos::keychain::SecKeychain;
 
 const SERVICE: &str = "pinentry-dispatch";
@@ -43,11 +44,26 @@ impl Store {
     }
 
     pub fn has(&self, keygrip: &str) -> bool {
-        self.0.find_generic_password(SERVICE, keygrip).is_ok()
+        self.exists(SERVICE, keygrip)
     }
 
     pub fn has_legacy(&self, keygrip: &str) -> bool {
-        self.0.find_generic_password(LEGACY_SERVICE, keygrip).is_ok()
+        self.exists(LEGACY_SERVICE, keygrip)
+    }
+
+    /// Attributes only. Fetching the password is what makes macOS ask the user to
+    /// authorise access, and an existence check that pops a dialog would block a
+    /// pinentry that has nobody in front of it.
+    fn exists(&self, service: &str, account: &str) -> bool {
+        ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .keychains(&[self.0.clone()])
+            .service(service)
+            .account(account)
+            .load_attributes(true)
+            .limit(1)
+            .search()
+            .is_ok_and(|found| !found.is_empty())
     }
 
     fn read(&self, service: &str, account: &str) -> Option<String> {
