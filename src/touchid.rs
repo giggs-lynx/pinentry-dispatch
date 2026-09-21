@@ -32,7 +32,7 @@ pub fn available() -> bool {
 pub fn authenticate(reason: &str) -> Outcome {
     let context = unsafe { LAContext::new() };
     unsafe {
-        context.setLocalizedFallbackTitle(Some(&NSString::from_str("改用密碼")));
+        context.setLocalizedFallbackTitle(Some(&NSString::from_str("Use passphrase")));
     }
 
     let (tx, rx) = mpsc::channel();

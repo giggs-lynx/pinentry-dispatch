@@ -5,7 +5,7 @@
 //! description, so an item whose service and account are both right is still invisible
 //! if the label differs. Keying on the account alone removes that whole class of bug.
 
-use security_framework::item::{ItemClass, ItemSearchOptions};
+use security_framework::item::{ItemClass, ItemSearchOptions, Reference, SearchResult};
 use security_framework::os::macos::keychain::SecKeychain;
 
 const SERVICE: &str = "pinentry-dispatch";
@@ -28,10 +28,19 @@ impl Store {
             .is_ok()
     }
 
-    pub fn forget(&self, keygrip: &str) {
-        if let Ok((_, item)) = self.0.find_generic_password(SERVICE, keygrip) {
-            item.delete();
-        }
+    /// Finds the item by reference rather than by fetching it, for the same reason as
+    /// `exists`: retrieving the password is what raises the authorisation dialog.
+    pub fn forget(&self, keygrip: &str) -> bool {
+        let Ok(found) = self.search(SERVICE, keygrip, true) else {
+            return false;
+        };
+        found.into_iter().any(|result| match result {
+            SearchResult::Ref(Reference::KeychainItem(item)) => {
+                item.delete();
+                true
+            }
+            _ => false,
+        })
     }
 
     /// Reading pinentry-mac's item asks macOS for permission once, because that item's
@@ -55,15 +64,29 @@ impl Store {
     /// authorise access, and an existence check that pops a dialog would block a
     /// pinentry that has nobody in front of it.
     fn exists(&self, service: &str, account: &str) -> bool {
-        ItemSearchOptions::new()
+        self.search(service, account, false)
+            .is_ok_and(|found| !found.is_empty())
+    }
+
+    fn search(
+        &self,
+        service: &str,
+        account: &str,
+        want_reference: bool,
+    ) -> security_framework::base::Result<Vec<SearchResult>> {
+        let mut options = ItemSearchOptions::new();
+        options
             .class(ItemClass::generic_password())
             .keychains(&[self.0.clone()])
             .service(service)
             .account(account)
-            .load_attributes(true)
-            .limit(1)
-            .search()
-            .is_ok_and(|found| !found.is_empty())
+            .limit(1);
+        if want_reference {
+            options.load_refs(true);
+        } else {
+            options.load_attributes(true);
+        }
+        options.search()
     }
 
     fn read(&self, service: &str, account: &str) -> Option<String> {

@@ -60,27 +60,53 @@ impl Conversation {
         }
     }
 
+    /// Writes one line to the caller's own terminal. Same rule as delegating: only
+    /// when the caller really is sitting on the terminal it reported, never on a tty
+    /// some stale environment variable happens to name.
+    fn tell_caller(&self, message: &str) {
+        let Some(ttyname) = self.ttyname.as_deref() else {
+            return;
+        };
+        if !self.owner_pid.map(Client::inspect).is_some_and(|c| c.owns_tty(Some(ttyname))) {
+            return;
+        }
+        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open(ttyname) {
+            let _ = writeln!(tty, "\r\n{message}");
+        }
+    }
+
     /// Touch ID needs every one of these. A missing stored passphrase is one of them,
     /// so the first signing after installation goes to the terminal and the answer it
     /// collects becomes the stored one — no separate setup step.
-    fn touch_id_is_eligible(&self, store: &Option<Store>) -> bool {
-        if self.already_answered_from_store || self.asking_for_a_new_passphrase {
-            return false;
+    ///
+    /// Returns the first condition that failed, so a signing that quietly went to the
+    /// terminal can say which one it was.
+    fn touch_id_blocker(&self, store: &Option<Store>) -> Option<&'static str> {
+        if self.already_answered_from_store {
+            return Some("the stored passphrase was already offered and refused");
+        }
+        if self.asking_for_a_new_passphrase {
+            return Some("this is a new passphrase (SETREPEAT)");
         }
         if !self.external_cache_allowed {
-            return false;
+            return Some("agent did not allow an external cache");
         }
         let Some(keygrip) = &self.keygrip else {
-            return false;
+            return Some("no keygrip (not SETKEYINFO n/...)");
         };
-        let Some(store) = store else { return false };
+        let Some(store) = store else {
+            return Some("no keychain");
+        };
         if !(store.has(keygrip) || store.has_legacy(keygrip)) {
-            return false;
+            return Some("nothing stored for this key");
         }
-        self.owner_pid
-            .map(Client::inspect)
-            .is_some_and(|c| c.is_local())
-            && touchid::available()
+        if !self.owner_pid.map(Client::inspect).is_some_and(|c| c.is_local()) {
+            return Some("caller is not local");
+        }
+        if !touchid::available() {
+            return Some("biometrics unavailable in this process");
+        }
+        None
     }
 }
 
@@ -127,9 +153,21 @@ fn main() {
                 None => respond(&mut out, "OK"),
             },
             // The agent sends this when a passphrase we supplied turned out to be wrong.
+            // The agent sends this when a passphrase we supplied was rejected. It then
+            // gives up on the whole signing, and what the person sees is gpg's terse
+            // "Bad passphrase" for something they never typed — so say what happened,
+            // on their own terminal, before that is all they have to go on.
             "CLEARPASSPHRASE" => {
-                if let (Some(store), Some(keygrip)) = (&store, &talk.keygrip) {
-                    store.forget(keygrip);
+                let grip = clearpassphrase_keygrip(&line).or_else(|| talk.keygrip.clone());
+                if let (Some(store), Some(grip)) = (&store, grip) {
+                    if store.forget(&grip) {
+                        note(&format!("forgot stored passphrase for {grip}"));
+                        talk.tell_caller(
+                            "pinentry-dispatch: the stored passphrase was rejected and has been \
+                             removed from the keychain. Signing will ask for it again, and the \
+                             answer you give will be stored in its place.",
+                        );
+                    }
                 }
                 respond(&mut out, "OK");
             }
@@ -137,15 +175,16 @@ fn main() {
                 if let Some(answer) = try_touch_id(&talk, &store) {
                     match answer {
                         Answer::Passphrase(secret) => {
+                            note("route touch-id (answered from store)");
                             talk.already_answered_from_store = true;
                             respond(&mut out, "S PASSWORD_FROM_CACHE");
                             respond(&mut out, &format!("D {}", escape(&secret)));
                             respond(&mut out, "OK");
                         }
-                        Answer::Refused => respond(
-                            &mut out,
-                            &format!("ERR {ERR_CANCELED} Operation cancelled"),
-                        ),
+                        Answer::Refused => {
+                            note("route touch-id (refused by user)");
+                            respond(&mut out, &format!("ERR {ERR_CANCELED} Operation cancelled"));
+                        }
                     }
                     continue;
                 }
@@ -171,14 +210,15 @@ enum Answer {
 }
 
 fn try_touch_id(talk: &Conversation, store: &Option<Store>) -> Option<Answer> {
-    if !talk.touch_id_is_eligible(store) {
+    if let Some(blocker) = talk.touch_id_blocker(store) {
+        note(&format!("touch-id skipped: {blocker}"));
         return None;
     }
     let keygrip = talk.keygrip.as_ref()?;
     let store = store.as_ref()?;
     let secret = store.get(keygrip).or_else(|| store.adopt_legacy(keygrip))?;
 
-    match touchid::authenticate("解鎖 GPG 金鑰以簽署") {
+    match touchid::authenticate("unlock your GPG key") {
         touchid::Outcome::Approved => Some(Answer::Passphrase(secret)),
         touchid::Outcome::Refused => Some(Answer::Refused),
         touchid::Outcome::TryAnotherRung => None,
@@ -275,6 +315,12 @@ fn normal_mode_keygrip(value: &str) -> Option<String> {
     value.strip_prefix("n/").map(|grip| grip.trim().to_string())
 }
 
+/// The agent sends this in a conversation of its own, with no SETKEYINFO before it,
+/// so the key has to be read out of the command itself.
+fn clearpassphrase_keygrip(line: &str) -> Option<String> {
+    normal_mode_keygrip(line.split_once(' ')?.1.trim())
+}
+
 /// `OPTION owner=<pid>/<uid> <hostname>`; the hostname is gpg-agent's own machine,
 /// so it says nothing about where the client is.
 fn parse_owner_pid(value: &str) -> Option<u32> {
@@ -308,6 +354,18 @@ fn unescape(text: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Our stderr lands in gpg-agent's log, which is not where anyone looks. With
+/// `PINENTRY_DISPATCH_LOG` set in the environment the agent was started from, the
+/// route taken is written somewhere a person can read.
+fn note(message: &str) {
+    eprintln!("pinentry-dispatch: {message}");
+    if let Ok(path) = env::var("PINENTRY_DISPATCH_LOG") {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{message}");
+        }
+    }
 }
 
 fn respond(out: &mut io::Stdout, line: &str) {
@@ -369,14 +427,15 @@ fn delegate(
 ) {
     let client = talk.owner_pid.map(Client::inspect);
     match &client {
-        Some(c) => eprintln!("pinentry-dispatch: client {}", c.describe()),
-        None => eprintln!("pinentry-dispatch: no owner reported"),
+        Some(c) => note(&format!("client {}", c.describe())),
+        None => note("no owner reported"),
     }
     if !client.as_ref().is_some_and(|c| c.owns_tty(talk.ttyname.as_deref())) {
         respond(
             &mut out,
             &format!("ERR {ERR_NO_PIN_ENTRY} no terminal the caller is sitting on"),
         );
+        note("route none (caller does not own the reported terminal)");
         return;
     }
 
@@ -392,12 +451,12 @@ fn delegate(
     {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("pinentry-dispatch: cannot start {}: {e}", binary.display());
+            note(&format!("cannot start {}: {e}", binary.display()));
             respond(&mut out, &format!("ERR {ERR_NO_PIN_ENTRY} cannot start {}", binary.display()));
             return;
         }
     };
-    eprintln!("pinentry-dispatch: route {}", binary.display());
+    note(&format!("route delegate {}", binary.display()));
 
     let mut to_child = child.stdin.take().expect("piped");
     let mut from_child = BufReader::new(child.stdout.take().expect("piped"));
@@ -427,7 +486,7 @@ fn delegate(
     if let (Some(store), Some(keygrip), Some(secret)) = (&store, &talk.keygrip, &seen.supplied) {
         if !seen.rejected && talk.external_cache_allowed && !talk.asking_for_a_new_passphrase {
             if store.put(keygrip, secret) {
-                eprintln!("pinentry-dispatch: stored passphrase for {keygrip}");
+                note(&format!("stored passphrase for {keygrip}"));
             }
         }
     }
@@ -547,13 +606,22 @@ mod tests {
             keygrip: Some("ABC".into()),
             ..Default::default()
         };
-        // No store at all is enough to disqualify, whatever else holds.
-        assert!(!talk.touch_id_is_eligible(&None));
+        assert_eq!(talk.touch_id_blocker(&None), Some("no keychain"));
         talk.external_cache_allowed = false;
-        assert!(!talk.touch_id_is_eligible(&None));
+        assert_eq!(talk.touch_id_blocker(&None), Some("agent did not allow an external cache"));
         talk.external_cache_allowed = true;
         talk.asking_for_a_new_passphrase = true;
-        assert!(!talk.touch_id_is_eligible(&None));
+        assert_eq!(
+            talk.touch_id_blocker(&None),
+            Some("this is a new passphrase (SETREPEAT)")
+        );
+    }
+
+    #[test]
+    fn the_key_to_forget_comes_from_the_command_not_from_earlier_state() {
+        assert_eq!(clearpassphrase_keygrip("CLEARPASSPHRASE n/ABC123").as_deref(), Some("ABC123"));
+        assert_eq!(clearpassphrase_keygrip("CLEARPASSPHRASE u/mine"), None);
+        assert_eq!(clearpassphrase_keygrip("CLEARPASSPHRASE"), None);
     }
 
     #[test]
