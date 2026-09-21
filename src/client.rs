@@ -118,14 +118,29 @@ fn read_controlling_tty(pid: u32) -> Option<String> {
 /// was started — not who is attached now. The attached clients are separate processes,
 /// so we look at those instead.
 fn any_herdr_client_over_ssh() -> bool {
-    let Some(pids) = run(&["pgrep", "-x", "herdr"]) else {
-        return false;
-    };
-    pids.split_whitespace()
-        .filter_map(|pid| pid.parse::<u32>().ok())
-        .filter(|pid| !run(&["ps", "-o", "command=", "-p", &pid.to_string()])
-            .is_some_and(|cmd| cmd.contains(" server")))
+    processes_named("herdr")
+        .into_iter()
+        .filter(|pid| {
+            !run(&["ps", "-o", "command=", "-p", &pid.to_string()])
+                .is_some_and(|cmd| cmd.contains(" server"))
+        })
         .any(has_sshd_ancestor)
+}
+
+/// Not `pgrep`: on macOS it does not report the caller's own ancestors, and looking
+/// for the multiplexer we are running under is exactly that case. `ps` has no such
+/// blind spot.
+fn processes_named(name: &str) -> Vec<u32> {
+    let Some(text) = run(&["ps", "-axo", "pid=,comm="]) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim().split_once(char::is_whitespace)?;
+            let base = command.trim().rsplit('/').next()?;
+            (base == name).then(|| pid.parse().ok()).flatten()
+        })
+        .collect()
 }
 
 fn has_sshd_ancestor(pid: u32) -> bool {
