@@ -14,3 +14,10 @@ opt-level = "z"
 lto = true
 strip = true
 panic = "abort"
+
+[dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-local-authentication = "0.3.2"
+security-framework = "3.7.0"
