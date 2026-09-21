@@ -7,8 +7,12 @@
 //!
 //! Vocabulary (client, rung, ladder, delegate, route) is defined in CONTEXT.md.
 //!
-//! This stage has no Touch ID and no keychain: every conversation is delegated.
+//! This stage has no Touch ID and no keychain: every conversation is delegated,
+//! but only to a terminal the client actually sits on.
 
+mod client;
+
+use client::Client;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
@@ -23,6 +27,19 @@ const ERR_NO_PIN_ENTRY: u32 = (5 << 24) | 85;
 const KNOWN_PREFIXES: [&str; 3] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
 
 fn main() {
+    let mut args = env::args().skip(1);
+    if args.next().as_deref() == Some("--explain") {
+        let pid = args.next().and_then(|a| a.parse().ok()).unwrap_or_else(|| {
+            eprintln!("usage: pinentry-dispatch --explain <client-pid>");
+            std::process::exit(2);
+        });
+        let client = Client::inspect(pid);
+        println!("{}", client.describe());
+        println!("local  = {}", client.is_local());
+        println!("owns   = {} (against the tty gpg would report)", client.owns_tty(env::var("GPG_TTY").ok().as_deref()));
+        return;
+    }
+
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut out = io::stdout();
@@ -31,6 +48,8 @@ fn main() {
 
     let mut pending: Vec<String> = Vec::new();
     let mut ttytype: Option<String> = None;
+    let mut ttyname: Option<String> = None;
+    let mut owner_pid: Option<u32> = None;
 
     loop {
         let mut line = String::new();
@@ -69,18 +88,38 @@ fn main() {
                 }
             }
             "GETPIN" | "CONFIRM" | "MESSAGE" => {
-                delegate(reader, out, &pending, &line, ttytype.as_deref());
+                delegate(
+                    reader,
+                    out,
+                    &pending,
+                    &line,
+                    ttytype.as_deref(),
+                    ttyname.as_deref(),
+                    owner_pid,
+                );
                 return;
             }
             _ => {
                 if let Some(value) = line.strip_prefix("OPTION ttytype=") {
                     ttytype = Some(value.to_string());
                 }
+                if let Some(value) = line.strip_prefix("OPTION ttyname=") {
+                    ttyname = Some(value.to_string());
+                }
+                if let Some(value) = line.strip_prefix("OPTION owner=") {
+                    owner_pid = parse_owner_pid(value);
+                }
                 pending.push(line);
                 respond(&mut out, "OK");
             }
         }
     }
+}
+
+/// `OPTION owner=<pid>/<uid> <hostname>`; the hostname is gpg-agent's own machine,
+/// so it tells us nothing about where the client is.
+fn parse_owner_pid(value: &str) -> Option<u32> {
+    value.split('/').next()?.trim().parse().ok()
 }
 
 fn respond(out: &mut io::Stdout, line: &str) {
@@ -134,7 +173,22 @@ fn delegate(
     pending: &[String],
     trigger: &str,
     ttytype: Option<&str>,
+    ttyname: Option<&str>,
+    owner_pid: Option<u32>,
 ) {
+    let client = owner_pid.map(Client::inspect);
+    match &client {
+        Some(c) => eprintln!("pinentry-dispatch: client {}", c.describe()),
+        None => eprintln!("pinentry-dispatch: no owner reported"),
+    }
+    if !client.as_ref().is_some_and(|c| c.owns_tty(ttyname)) {
+        respond(
+            &mut out,
+            &format!("ERR {ERR_NO_PIN_ENTRY} no terminal the caller is sitting on; unlock the agent from a real terminal first"),
+        );
+        return;
+    }
+
     let Some(binary) = pick_terminal_rung(ttytype) else {
         respond(
             &mut out,
@@ -159,6 +213,7 @@ fn delegate(
         }
     };
 
+    eprintln!("pinentry-dispatch: route {}", binary.display());
     let mut to_child = child.stdin.take().expect("piped");
     let mut from_child = BufReader::new(child.stdout.take().expect("piped"));
 
@@ -253,6 +308,12 @@ mod tests {
     #[test]
     fn a_missing_binary_is_not_located() {
         assert!(locate("pinentry-does-not-exist-xyz").is_none());
+    }
+
+    #[test]
+    fn owner_pid_is_the_part_before_the_slash() {
+        assert_eq!(parse_owner_pid("28873/501 giggs-m1p"), Some(28873));
+        assert_eq!(parse_owner_pid("nonsense"), None);
     }
 
     #[test]
