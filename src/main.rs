@@ -219,7 +219,14 @@ fn try_touch_id(talk: &Conversation, store: &Option<Store>) -> Option<Answer> {
     }
     let keygrip = talk.keygrip.as_ref()?;
     let store = store.as_ref()?;
-    let secret = store.get(keygrip).or_else(|| store.adopt_legacy(keygrip))?;
+    let secret = match store.get(keygrip) {
+        Some(secret) => secret,
+        None => {
+            let inherited = store.adopt_legacy(keygrip)?;
+            note(&format!("adopted pinentry-mac's stored passphrase for {keygrip}"));
+            inherited
+        }
+    };
 
     match touchid::authenticate("unlock your GPG key") {
         touchid::Outcome::Approved => Some(Answer::Passphrase(secret)),
