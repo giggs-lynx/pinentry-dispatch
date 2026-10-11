@@ -89,7 +89,8 @@ pinentry-dispatch doctor
 ```
 
 says which rung the current situation would reach and what each condition
-contributed. Run it from the terminal you are asking about.
+contributed. Run it from the terminal you are asking about. `pinentry-dispatch --version`
+prints the installed version.
 
 Set `PINENTRY_DISPATCH_LOG` in the environment `gpg-agent` is started from to record
 the route of every signing to that file — useful when a prompt appears somewhere you

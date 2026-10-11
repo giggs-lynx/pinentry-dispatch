@@ -115,8 +115,13 @@ impl Conversation {
 
 fn main() {
     let mut args = env::args().skip(1);
-    if args.next().as_deref() == Some("doctor") {
-        return doctor(args.collect());
+    match args.next().as_deref() {
+        Some("doctor") => return doctor(args.collect()),
+        Some("--version") => {
+            println!("pinentry-dispatch {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        _ => {}
     }
 
     let stdin = io::stdin();
